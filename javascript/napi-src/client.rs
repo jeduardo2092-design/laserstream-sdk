@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde_json;
 use base64::{Engine as _, engine::general_purpose};
 
+#[allow(deprecated)] // NotifyOn is a deprecated no-op (Agave 4.2); kept for backward-compat mapping
+use laserstream_core_proto::geyser::NotifyOn;
 use laserstream_core_proto::geyser::{
     SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks,
     SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
@@ -17,7 +19,24 @@ use laserstream_core_proto::geyser::{
     subscribe_request_filter_accounts_filter_lamports,
     subscribe_request_filter_accounts_filter,
     SubscribePreprocessedRequest, SubscribePreprocessedRequestFilterTransactions,
+    CuckooFilter, TokenAccountExpansionControlFlag,
 };
+
+/// Map the JS-facing `tokenAccounts` string to the proto enum tag the wire
+/// format expects. Returns `Ok(None)` for an absent / "none" value so the
+/// proto field stays omitted (= no ATA expansion). Returns an error for
+/// any other string so a typo is loud at subscribe time, not a silent
+/// "no expansion happened".
+fn parse_token_accounts_mode(value: Option<String>) -> std::result::Result<Option<i32>, String> {
+    match value.as_deref() {
+        None | Some("") | Some("none") => Ok(None),
+        Some("all") => Ok(Some(TokenAccountExpansionControlFlag::All as i32)),
+        Some("balanceChanged") => Ok(Some(TokenAccountExpansionControlFlag::BalanceChanged as i32)),
+        Some(other) => Err(format!(
+            "invalid tokenAccounts mode `{other}`; expected \"none\", \"balanceChanged\", or \"all\""
+        )),
+    }
+}
 
 use crate::stream::StreamInner;
 
@@ -79,6 +98,11 @@ pub struct JsAccountFilter {
     pub filters: Option<Vec<JsAccountsFilter>>,
     #[serde(alias = "nonemptyTxnSignature")]
     pub nonempty_txn_signature: Option<bool>,
+    // DEPRECATED (no-op as of Agave 4.2): the validator now skips updates for
+    // accounts write-locked but never written, so "write"-only delivery is the
+    // default and only behavior. Still accepted for backward compatibility.
+    #[serde(alias = "notifyOn")]
+    pub notify_on: Option<String>,
     // Add aliases for consistent interface matching transactions
     #[serde(alias = "accountInclude")]
     pub account_include: Option<Vec<String>>,
@@ -86,6 +110,26 @@ pub struct JsAccountFilter {
     pub account_exclude: Option<Vec<String>>,
     #[serde(alias = "accountRequired")]
     pub account_required: Option<Vec<String>>,
+    // Compressed account (cuckoo) filter, built client-side via CompressedAccountFilterSet.
+    #[serde(alias = "cuckooAccountsFilter")]
+    pub cuckoo_accounts_filter: Option<JsCuckooFilter>,
+}
+
+// Wire form of a client-built cuckoo filter. `data` is base64 (LE u16 fingerprints)
+// and `hash_seed` is a decimal string (u64 exceeds JS safe-integer range).
+#[derive(Deserialize, Debug)]
+pub struct JsCuckooFilter {
+    pub data: String, // base64
+    #[serde(alias = "bucketCount")]
+    pub bucket_count: u32,
+    #[serde(alias = "entriesPerBucket")]
+    pub entries_per_bucket: u32,
+    #[serde(alias = "fingerprintBits")]
+    pub fingerprint_bits: u32,
+    #[serde(alias = "hashSeed")]
+    pub hash_seed: String, // decimal u64
+    #[serde(alias = "hashAlgorithm")]
+    pub hash_algorithm: i32,
 }
 
 #[derive(Deserialize, Debug)]
@@ -132,6 +176,12 @@ pub struct JsTransactionFilter {
     pub account_exclude: Option<Vec<String>>,
     #[serde(alias = "accountRequired")]
     pub account_required: Option<Vec<String>>,
+    // Helius ATA expansion control (proto field #30): "none" | "balanceChanged" | "all".
+    #[serde(alias = "tokenAccounts")]
+    pub token_accounts: Option<String>,
+    // Cuckoo filter over accountInclude (proto field #31), built client-side.
+    #[serde(alias = "cuckooAccountInclude")]
+    pub cuckoo_account_include: Option<JsCuckooFilter>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -200,7 +250,7 @@ impl ClientInner {
         Ok(Self {
             endpoint,
             token,
-            max_reconnect_attempts: max_reconnect_attempts.unwrap_or(120),
+            max_reconnect_attempts: max_reconnect_attempts.unwrap_or(240),
             channel_options,
             // Default to true (replay enabled) unless explicitly set to false
             replay: replay.unwrap_or(true),
@@ -246,6 +296,19 @@ impl ClientInner {
                     // accountRequired not directly supported for account subscriptions
                 }
                 
+                // DEPRECATED (no-op as of Agave 4.2): map the "lock" | "write"
+                // string to the proto NotifyOn enum for backward compatibility.
+                // The server ignores it — write-only delivery is now the default
+                // and only behavior. Unknown strings fall back to Lock.
+                #[allow(deprecated)]
+                if let Some(notify_on) = filter.notify_on.as_deref() {
+                    let state = match notify_on {
+                        "write" => NotifyOn::Write,
+                        _ => NotifyOn::Lock,
+                    };
+                    yellowstone_filter.notify_on = state as i32;
+                }
+
                 if let Some(nonempty_txn_signature) = filter.nonempty_txn_signature {
                     yellowstone_filter.nonempty_txn_signature = Some(nonempty_txn_signature);
                 }
@@ -303,7 +366,23 @@ impl ClientInner {
                     }
                     yellowstone_filter.filters = yellowstone_filters;
                 }
-                
+
+                // Handle compressed account (cuckoo) filter — pass through bytes built client-side.
+                if let Some(cuckoo) = filter.cuckoo_accounts_filter {
+                    let data = general_purpose::STANDARD.decode(&cuckoo.data)
+                        .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid base64 cuckoo data: {}", e)))?;
+                    let hash_seed = cuckoo.hash_seed.parse::<u64>()
+                        .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid cuckoo hash_seed: {}", e)))?;
+                    yellowstone_filter.cuckoo_accounts_filter = Some(CuckooFilter {
+                        data,
+                        bucket_count: cuckoo.bucket_count,
+                        entries_per_bucket: cuckoo.entries_per_bucket,
+                        fingerprint_bits: cuckoo.fingerprint_bits,
+                        hash_seed,
+                        hash_algorithm: cuckoo.hash_algorithm,
+                    });
+                }
+
                 accounts_map.insert(key, yellowstone_filter);
             }
             request.accounts = accounts_map;
@@ -349,34 +428,56 @@ impl ClientInner {
                 if let Some(account_required) = filter.account_required {
                     yellowstone_filter.account_required = account_required;
                 }
-                
+
+                yellowstone_filter.token_accounts = parse_token_accounts_mode(filter.token_accounts)
+                    .map_err(Error::from_reason)?;
+
+                // Handle compressed account (cuckoo) filter — pass through bytes built client-side.
+                if let Some(cuckoo) = filter.cuckoo_account_include {
+                    let data = general_purpose::STANDARD.decode(&cuckoo.data)
+                        .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid base64 cuckoo data: {}", e)))?;
+                    let hash_seed = cuckoo.hash_seed.parse::<u64>()
+                        .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid cuckoo hash_seed: {}", e)))?;
+                    yellowstone_filter.cuckoo_account_include = Some(CuckooFilter {
+                        data,
+                        bucket_count: cuckoo.bucket_count,
+                        entries_per_bucket: cuckoo.entries_per_bucket,
+                        fingerprint_bits: cuckoo.fingerprint_bits,
+                        hash_seed,
+                        hash_algorithm: cuckoo.hash_algorithm,
+                    });
+                }
+
                 transactions_map.insert(key, yellowstone_filter);
             }
             request.transactions = transactions_map;
         }
-        
+
         // Handle transactions_status with complete filter support
         if let Some(transactions_status) = js_request.transactions_status {
             let mut transactions_status_map = HashMap::new();
             for (key, filter) in transactions_status {
                 let mut yellowstone_filter = SubscribeRequestFilterTransactions::default();
-                
+
                 yellowstone_filter.vote = filter.vote;
                 yellowstone_filter.failed = filter.failed;
                 yellowstone_filter.signature = filter.signature;
-                
+
                 if let Some(account_include) = filter.account_include {
                     yellowstone_filter.account_include = account_include;
                 }
-                
+
                 if let Some(account_exclude) = filter.account_exclude {
                     yellowstone_filter.account_exclude = account_exclude;
                 }
-                
+
                 if let Some(account_required) = filter.account_required {
                     yellowstone_filter.account_required = account_required;
                 }
-                
+
+                yellowstone_filter.token_accounts = parse_token_accounts_mode(filter.token_accounts)
+                    .map_err(Error::from_reason)?;
+
                 transactions_status_map.insert(key, yellowstone_filter);
             }
             request.transactions_status = transactions_status_map;

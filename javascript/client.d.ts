@@ -101,3 +101,64 @@ export declare function decodeSubscribeUpdate(bytes: Uint8Array): SubscribeUpdat
 export declare function decodeSubscribePreprocessedUpdate(bytes: Uint8Array): SubscribePreprocessedUpdate;
 export declare function shutdownAllStreams(): void;
 export declare function getActiveStreamCount(): number;
+
+// ============================================================================
+// Compressed account (cuckoo) filtering
+// ============================================================================
+
+export {
+  CompressedAccountFilterSet,
+  TableFullError,
+  DEFAULT_HASH_SEED,
+  CuckooFilterProto,
+  CuckooAccountFilter,
+  CuckooTransactionFilter,
+  PubkeyInput,
+} from './cuckoo';
+
+// ============================================================================
+// tokenAccounts (ATA) transaction filter
+// ============================================================================
+
+/**
+ * ATA (Associated Token Account) expansion mode for the `tokenAccounts` field
+ * on transaction / transactionsStatus filters.
+ *
+ * - `"none"`           — no expansion (default; same as omitting the field).
+ * - `"balanceChanged"` — also match txs touching an ATA owned by an
+ *                        `accountInclude` wallet whose token balance changed.
+ * - `"all"`            — match any tx touching an ATA owned by an
+ *                        `accountInclude` wallet.
+ *
+ * The JS-facing API accepts these strings for ergonomics; the NAPI layer
+ * converts to the proto enum (`TokenAccountExpansionControlFlag` at field
+ * #30) before sending on the wire. Invalid strings raise at subscribe time.
+ */
+export type TokenAccountsFilterMode = 'none' | 'balanceChanged' | 'all';
+
+// Augment the generated proto type so `tokenAccounts` is accepted on
+// transaction filters without forking the generated bindings. Removed once a
+// core-proto-js release ships field #30 natively.
+declare module 'laserstream-core-proto-js/generated' {
+  namespace geyser {
+    interface ISubscribeRequestFilterTransactions {
+      /** Helius ATA expansion control (proto field #30). */
+      tokenAccounts?: (TokenAccountsFilterMode | string | null);
+      /**
+       * Compressed account (cuckoo) filter over `accountInclude` (proto field #31).
+       * Built client-side via {@link CompressedAccountFilterSet.toTransactionFilter}.
+       */
+      cuckooAccountInclude?: (import('./cuckoo').CuckooFilterProto | null);
+    }
+    interface ISubscribeRequestFilterAccounts {
+      /**
+       * @deprecated No-op as of Agave 4.2. The validator now skips updates for
+       * accounts a transaction write-locked but never wrote to, so `'write'`-only
+       * delivery is the default and only behavior. Setting this has no effect; it
+       * is accepted only for backward compatibility and will be removed in a
+       * future release. (proto field #31)
+       */
+      notifyOn?: ('lock' | 'write' | null);
+    }
+  }
+}

@@ -22,7 +22,7 @@ use laserstream_core_proto::geyser::{
 const HARD_CAP_RECONNECT_ATTEMPTS: u32 = (20 * 60) / 5; // 20 mins / 5 sec interval
 const FIXED_RECONNECT_INTERVAL_MS: u64 = 5000; // 5 seconds fixed interval
 const SDK_NAME: &str = "laserstream-rust";
-const SDK_VERSION: &str = "0.1.10";
+const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Custom interceptor that adds SDK metadata headers to all gRPC requests
 #[derive(Clone)]
@@ -218,9 +218,9 @@ pub fn subscribe(
                                             }
                                         }
                                         Err(status) => {
-                                            // Yield the error to consumer AND continue with reconnection
+                                            // Transient error: reconnect silently. Surfaced to the consumer
+                                            // only on terminal failure (max attempts) — see the Err arm below.
                                             warn!(error = %status, "Stream error, will reconnect after 5s delay");
-                                            yield Err(LaserstreamError::Status(status.clone()));
                                             break;
                                         }
                                     }
@@ -331,7 +331,7 @@ async fn connect_and_subscribe_once(
     // Configure message size limits
     geyser_client = geyser_client
         .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
-        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(64 * 1024 * 1024));
 
     // Configure compression if specified
     if let Some(send_comp) = options.send_compression {
@@ -468,7 +468,7 @@ async fn connect_and_subscribe_preprocessed_once(
 
     let mut geyser_client = GeyserClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
-        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(64 * 1024 * 1024));
 
     // Apply compression if specified
     if let Some(compression) = &options.send_compression {

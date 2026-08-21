@@ -23,7 +23,7 @@ const FORK_DEPTH_SAFETY_MARGIN: u64 = 31; // Max fork depth for processed commit
 
 // SDK metadata constants
 const SDK_NAME: &str = "laserstream-javascript";
-const SDK_VERSION: &str = "0.3.2";
+const SDK_VERSION: &str = "0.6.1";
 
 /// Custom interceptor that adds SDK metadata headers to all gRPC requests
 #[derive(Clone)]
@@ -81,14 +81,14 @@ impl ChannelConfig {
             });
 
             Self {
-                max_send_msg_size: opts.grpc_max_send_message_length.map(|v| v as usize).unwrap_or(32_000_000),
+                max_send_msg_size: opts.grpc_max_send_message_length.map(|v| v as usize).unwrap_or(64 * 1024 * 1024),
                 max_recv_msg_size: opts.grpc_max_receive_message_length.map(|v| v as usize).unwrap_or(1_000_000_000),
                 send_compression,
                 accept_compression: send_compression,
             }
         } else {
             Self {
-                max_send_msg_size: 32_000_000,
+                max_send_msg_size: 64 * 1024 * 1024,
                 max_recv_msg_size: 1_000_000_000,
                 send_compression: None,
                 accept_compression: None,

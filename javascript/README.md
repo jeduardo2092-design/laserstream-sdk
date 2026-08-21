@@ -142,6 +142,36 @@ const request = {
 };
 ```
 
+#### tokenAccounts (ATA) Expansion
+
+Set `tokenAccounts` on a transaction filter to also match transactions that
+touch an **Associated Token Account (ATA)** owned by one of the `accountInclude`
+wallets, not just transactions naming the wallet directly. Modes (server wire
+values):
+
+- `"none"` — no expansion (default; same as omitting the field).
+- `"balanceChanged"` — also match txs touching an ATA owned by an
+  `accountInclude` wallet whose token balance changed.
+- `"all"` — match any tx touching an ATA owned by an `accountInclude` wallet.
+
+```typescript
+const request = {
+  transactions: {
+    "wallet-and-atas": {
+      accountInclude: ["vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg"],
+      accountExclude: [],
+      accountRequired: [],
+      vote: false,
+      failed: false,
+      tokenAccounts: "balanceChanged",
+    },
+  },
+  commitment: CommitmentLevel.CONFIRMED,
+};
+```
+
+See [`examples/token-accounts-sub.ts`](./examples/token-accounts-sub.ts).
+
 ### Block Subscriptions
 ```typescript
 const request = {
@@ -217,9 +247,73 @@ stream.write({
 });
 ```
 
+## Compressed Account Filters (Cuckoo)
+
+When you track a large set of accounts (tens of thousands to millions), sending an
+explicit pubkey list in every `SubscribeRequest` is expensive (~32 bytes/account).
+A **cuckoo filter** replaces that list with a compact probabilistic set
+(~3 bytes/account). The server matches accounts against the filter with **no false
+negatives** and **<1% false positives** — you re-check each incoming account locally
+against your exact set with `contains()`, making the stream exact for your code.
+
+```typescript
+import { subscribe, CommitmentLevel, CompressedAccountFilterSet } from 'helius-laserstream';
+
+// Size the filter for your peak tracked-set size.
+const tracked = new CompressedAccountFilterSet(2_000_000);
+for (const pubkey of myTrackedPubkeys) {
+  tracked.insert(pubkey); // base58 string, Uint8Array/Buffer, or web3.js PublicKey
+}
+
+// Attach the filter to the request (no explicit account list needed).
+const request = { accounts: {}, commitment: CommitmentLevel.CONFIRMED };
+tracked.insertIntoSubscribeRequest(request, 'tracked_accounts');
+
+const stream = await subscribe(config, request, (update) => {
+  const acct = update.account?.account;
+  // Re-check locally to drop the server's rare false positives.
+  if (acct && tracked.contains(acct.pubkey)) {
+    handleTrackedAccount(acct);
+  }
+});
+```
+
+Update the tracked set on the fly and re-send on the **same** stream:
+
+```typescript
+tracked.insert(newPubkey);   // or tracked.remove(oldPubkey)
+if (tracked.takeDirty()) {   // only re-send when the set actually changed
+  tracked.insertIntoSubscribeRequest(request, 'tracked_accounts');
+  await stream.write(request);
+}
+```
+
+The same filter also works on **transaction** subscriptions, where it stands in for the
+`accountInclude` list (match any transaction that mentions a tracked account):
+
+```typescript
+const tracked = new CompressedAccountFilterSet(2_000_000);
+for (const pubkey of myTrackedPubkeys) {
+  tracked.insert(pubkey);
+}
+
+const request = { transactions: {}, commitment: CommitmentLevel.CONFIRMED };
+request.transactions['tracked_transactions'] = tracked.toTransactionFilter();
+
+const stream = await subscribe(config, request, (update) => {
+  // Re-check the touched accounts locally to drop the server's rare false positives.
+  console.log('transaction update:', update.transaction);
+});
+```
+
+Notes:
+- **Account and transaction subscriptions.** Filters up to 32 MiB (~10M accounts).
+- `insert()` throws `TableFullError` if the filter saturates — rebuild with a larger capacity.
+- `contains()` is exact (backed by an internal `Set`); the cuckoo table is used only on the wire.
+
 ## Compression Examples
 
-### Zstd Compression (Recommended)
+### Zstd Compression
 ```typescript
 import { CompressionAlgorithms } from 'helius-laserstream';
 
